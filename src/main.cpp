@@ -51,13 +51,13 @@ int TryPassToPrimaryInstance(const std::string& path, bool waitForExit) {
         return -255; // Signifies no primary instance is alive
     }
 
-    // Prefix the payload packet so the daemon knows the routing behavior requested
-    std::string packet = (waitForExit ? "WAIT:" : "NOWAIT:") + path;
+    std::string packet = path; // Path already contains WAIT/NOWAIT prefix from main()
 
     DWORD bytesWritten;
     WriteFile(hPipe, packet.c_str(), static_cast<DWORD>(packet.length()), &bytesWritten, NULL);
 
     int returnedExitCode = -1; // Default to error if daemon crashes
+    bool exitCodeFound = false;
     
     if (waitForExit) {
         // Block execution thread right here until the daemon crunches bytecode and replies
@@ -75,11 +75,17 @@ int TryPassToPrimaryInstance(const std::string& path, bool waitForExit) {
                 try {
                     // Safely extract the exit code and stop processing
                     returnedExitCode = std::stoi(msg.substr(exitPos + 5));
+                    exitCodeFound = true;
                 } catch (...) { returnedExitCode = -1; }
                 break;
             }
             std::fwrite(msg.data(), 1, bytesRead, stdout);
         }
+    }
+
+    if (waitForExit && !exitCodeFound) {
+        std::fprintf(stderr, "\n[VXE Error] The background engine disconnected without providing an exit code.\n");
+        std::fprintf(stderr, "This typically indicates the engine crashed (e.g., SIGSEGV) while executing the bytecode.\n");
     }
 
     CloseHandle(hPipe);
@@ -109,10 +115,12 @@ void RunIPCPipeListener() {
                 
                 // Smarter path extraction: skip known protocol headers to preserve drive letters
                 size_t pathStart = 0;
-                if (rawPacket.find("NODEBUG:") != std::string::npos) pathStart = rawPacket.find("NODEBUG:") + 8;
-                else if (rawPacket.find("DEBUG:") != std::string::npos) pathStart = rawPacket.find("DEBUG:") + 6;
-                else pathStart = rawPacket.find(":") + 1;
-                std::string targetPath = rawPacket.substr(pathStart);
+                size_t debugPos = rawPacket.find("DEBUG:");
+                size_t noDebugPos = rawPacket.find("NODEBUG:");
+                pathStart = (noDebugPos != std::string::npos) ? noDebugPos + 8 : 
+                            (debugPos != std::string::npos) ? debugPos + 6 : rawPacket.find(":") + 1;
+                
+                std::string targetPath = (pathStart < rawPacket.length()) ? rawPacket.substr(pathStart) : "";
 
                 g_vxe_ipc_out = hPipe;
                 int bytecodeExitCode = g_VulpineDriverEngine.LoadAndExecute(targetPath, clientIsWaiting, debugRequested);
@@ -229,6 +237,7 @@ auto main(int argc, char** argv) -> int {
     // 1. Process basic CLI flag validations
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        std::printf("[main] Processing arg: %s\n", arg.c_str()); std::fflush(stdout);
         // Support both "debug" command and "--debug" flag
         if ((arg == "debug" && i == 1) || arg == "--debug") {
             debugMode = true;
@@ -240,7 +249,8 @@ auto main(int argc, char** argv) -> int {
     }
 
     // 2. If a file payload was specified, try passing to the active background daemon
-    if (!targetPath.empty()) {
+    // Skip IPC hand-off if debugMode is enabled so the user can see local logs/errors
+    if (!targetPath.empty() && !debugMode) {
         int ipcResult = TryPassToPrimaryInstance(std::string(waitForExit ? "WAIT:" : "NOWAIT:") + std::string(debugMode ? "DEBUG:" : "NODEBUG:") + targetPath, waitForExit);
         if (ipcResult != -255) {
             // Hand-off matched an active listener! Exit proxy process with the engine's true result code
@@ -249,18 +259,22 @@ auto main(int argc, char** argv) -> int {
     }
 
     // 3. We are the primary instance. Initialize core hardware pooling
+    std::printf("[main] Initializing VDE engine...\n"); std::fflush(stdout);
     if (g_VulpineDriverEngine.Initialize() != 0) {
         std::printf("[Fatal Error] VDE failed to initialize core hardware layers.\n");
         return 1;
     }
 
+    std::printf("[main] Processing direct payload...\n"); std::fflush(stdout);
     // 4. Process direct payload targets passed to this first boot context
     if (!targetPath.empty()) {
         int bootExit = g_VulpineDriverEngine.LoadAndExecute(targetPath, waitForExit, debugMode);
+        std::printf("[main] LoadAndExecute returned: %d\n", bootExit); std::fflush(stdout);
         
         // If the user specified --wait on the very first boot instance, we exit immediately with the code
         if (waitForExit) {
             g_VulpineDriverEngine.Shutdown();
+            std::printf("[main] Final process exit code: %d\n", bootExit); std::fflush(stdout);
             return bootExit;
         }
     } else {

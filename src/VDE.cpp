@@ -149,16 +149,27 @@ auto VDE::ExitBackgroundIdlingMode() -> int {
 }
 
 auto VDE::LoadAndExecute(std::string path, bool wait, bool debugMode) -> int {
+    if (debugMode) { std::printf("[VDE] LoadAndExecute called for: %s\n", path.c_str()); std::fflush(stdout); }
     m_debugMode = debugMode; // Set debug mode for this execution
     ExitBackgroundIdlingMode();
     
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return -1;
+    if (!file.is_open()) {
+        std::printf("[VDE Error] Could not open file: %s\n", path.empty() ? "(empty path)" : path.c_str());
+        std::fflush(stdout);
+        return -1;
+    }
 
     file.seekg(0, std::ios::end);
-    size_t fileSize = file.tellg();
+    std::streampos sizePos = file.tellg();
+    if (sizePos == std::streampos(-1)) { std::printf("[VDE Error] Failed to read file size.\n"); std::fflush(stdout); return -1; }
+    size_t fileSize = static_cast<size_t>(sizePos);
+
     file.seekg(0, std::ios::beg);
-    if (fileSize < 48) return -2; // Header is too small
+    if (fileSize < 48) {
+        if (debugMode) { std::printf("[VDE Error] Header too small (%zu bytes). Invalid VXE.\n", fileSize); std::fflush(stdout); }
+        return -2;
+    }
 
     std::vector<uint8_t> localBytes(fileSize);
     file.read(reinterpret_cast<char*>(localBytes.data()), fileSize);
@@ -200,16 +211,16 @@ auto VDE::LoadAndExecute(std::string path, bool wait, bool debugMode) -> int {
     }
 
     if (!sliceFound) {
-        uint8_t foundID = (localBytes.size() >= 0x31) ? localBytes[0x30] : 0;
+        if (debugMode) { std::printf("[VDE Error] No compatible architecture found (Target Arch: %d)\n", (int)hostArchTarget); std::fflush(stdout); }
+        return -4;
     }
-
-    if (!sliceFound) return -4;
 
     // 3. Setup Task
     uint64_t taskId;
     // Load the entire bytecode segment for this architecture
     const uint8_t* codePayloadPtr = localBytes.data() + targetSlice.off;
     size_t codePayloadSize = targetSlice.size;
+    if (debugMode) { std::printf("[VDE] Found Bytecode: Offset %llu, Size %llu\n", targetSlice.off, targetSlice.size); std::fflush(stdout); }
 
     {
         std::lock_guard<std::mutex> lock(g_TaskMapMutex);
@@ -235,7 +246,11 @@ auto VDE::Shutdown() -> int {
 }
 
 auto VDE::run(const uint8_t* codeBuffer, size_t size, uint64_t entryOffset, uint64_t taskId, bool debugMode) -> int {
-    if (size == 0 || !codeBuffer) return -1;
+    if (size == 0 || !codeBuffer) {
+        if (debugMode) { std::printf("[VDE Error] Bytecode size is 0. Returning -1.\n"); std::fflush(stdout); }
+        return -1;
+    }
+    if (debugMode) { std::printf("[VDE] Bytecode validated. Entering JIT bridge...\n"); std::fflush(stdout); }
 
     VXE_Context ctx;
     ctx.vxe_alloc    = reinterpret_cast<decltype(ctx.vxe_alloc)>(native_vxe_alloc);
@@ -327,5 +342,4 @@ auto VDE::run(const uint8_t* codeBuffer, size_t size, uint64_t entryOffset, uint
     }
 
     return static_cast<int>(final_exit_code);
-    return static_cast<int32_t>(final_exit_code);
 }
